@@ -1,0 +1,156 @@
+# advanced_social_bot.py
+import asyncio
+import logging
+from datetime import datetime, timezone
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+import aiohttp
+import feedparser  # for YouTube RSS
+import os
+from bs4 import BeautifulSoup
+import hashlib
+
+# === CONFIG ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHECK_INTERVAL = 60  # seconds (every 1 minute)
+
+# Storage (in-memory for now, survives restarts on Render because we use a dict)
+pages_db = {}        # {chat_id: {url: last_hash or last_video_id}}
+user_chats = set()   # all chat_ids that use the bot
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_chats.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "✅ Social Tracker Bot started!\n\n"
+        "Commands:\n"
+        "/addpage facebook <full URL>\n"
+        "/addpage youtube <channel URL or @handle>\n"
+        "/removepage facebook/youtube <URL>\n"
+        "/listpages"
+    )
+
+async def add_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addpage facebook|youtube <URL>")
+        return
+
+    platform = context.args[0].lower()
+    url = context.args[1]
+
+    chat_id = update.effective_chat.id
+    if chat_id not in pages_db:
+        pages_db[chat_id] = {}
+
+    if url in pages_db[chat_id]:
+        await update.message.reply_text("Already tracking this page!")
+        return
+
+    pages_db[chat_id][url] = {"platform": platform, "last": None}
+    await update.message.reply_text(f"Added {platform} page: {url}\nYou will get notifications for new posts/videos!")
+
+async def remove_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /removepage facebook|youtube <URL>")
+        return
+
+    url = context.args[1]
+    chat_id = update.effective_chat.id
+
+    if chat_id in pages_db and url in pages_db[chat_id]:
+        del pages_db[chat_id][url]
+        await update.message.reply_text(f"Removed {url}")
+    else:
+        await update.message.reply_text("Not tracking this page.")
+
+async def list_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in pages_db or not pages_db[chat_id]:
+        await update.message.reply_text("No pages tracked yet. Use /addpage")
+        return
+
+    text = "Tracked pages:\n\n"
+    for url, info in pages_db[chat_id].items():
+        text += f"{info['platform'].upper()}: {url}\n"
+    await update.message.reply_text(text)
+
+async def check_facebook(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            text = await resp.text()
+
+    soup = BeautifulSoup(text, 'html.parser')
+    # Facebook mobile version is easier to parse
+    posts = soup.find_all('div', {'data-ft': True})
+    if not posts:
+        return None
+    first_post = posts[0]
+    post_hash = hashlib.md5(str(first_post).encode()).hexdigest()
+    return post_hash
+
+async def check_youtube(url):
+    # Convert various YouTube formats to channel ID or handle
+    if "/channel/" in url:
+        channel_id = url.split("/channel/")[1].split("/")[0].split("?")[0]
+    elif "/c/" in url or "/@" in url:
+        handle = url.split("/c/")[-1].split("/@")[-1].split("/")[0]
+        rss_url = f"https://www.youtube.com/feeds/videos.xml?user={handle}"
+    else:
+        return None
+
+    if 'channel_id' in locals():
+        rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+    feed = feedparser.parse(rss_url)
+    if not feed.entries:
+        return None
+    latest_video_id = feed.entries[0].yt_videoid
+    return latest_video_id
+
+async def monitor_task():
+    while True:
+        for chat_id in list(user_chats):
+            if chat_id not in pages_db:
+                continue
+            for url, info in pages_db[chat_id].items():
+                try:
+                    if info["platform"] == "facebook":
+                        new_hash = await check_facebook(url)
+                    elif info["platform"] == "youtube":
+                        new_hash = await check_youtube(url)
+                    else:
+                        continue
+
+                    if new_hash and new_hash != info["last"]:
+                        # NEW CONTENT!
+                        await application.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"NEW {'POST' if info['platform']=='facebook' else 'VIDEO'}!\n{url}"
+                        )
+                        pages_db[chat_id][url]["last"] = new_hash
+                except Exception as e:
+                    logger.error(f"Error checking {url}: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+def main():
+    global application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addpage", add_page))
+    application.add_handler(CommandHandler("removepage", remove_page))
+    application.add_handler(CommandHandler("listpages", list_pages))
+
+    # Start monitoring in background
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_task())
+
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
